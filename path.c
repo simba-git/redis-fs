@@ -146,26 +146,117 @@ int fsIsRoot(const char *path, size_t len) {
     return (len == 1 && path[0] == '/');
 }
 
-/* Simple glob matching supporting * and ? wildcards. */
-int fsGlobMatch(const char *pattern, const char *string) {
+/*
+ * Full glob pattern matching — supports *, ?, [...], [!...], and \ escaping.
+ * Modeled after Redis's stringmatchlen() and POSIX fnmatch() semantics.
+ *
+ *   *        Match zero or more characters.
+ *   ?        Match exactly one character.
+ *   [abc]    Match one of a, b, or c.
+ *   [a-z]    Match any character in range a through z (inclusive).
+ *   [!abc]   Match any character NOT in the set (^ also accepted).
+ *   \x       Match the literal character x (escaping wildcards).
+ *
+ * The nocase parameter controls case-insensitive matching.
+ */
+static int fsGlobMatchInternal(const char *pattern, const char *string, int nocase) {
     while (*pattern && *string) {
-        if (*pattern == '*') {
-            pattern++;
-            /* Handle ** */
+        switch (*pattern) {
+        case '*':
+            /* Collapse consecutive stars. */
             while (*pattern == '*') pattern++;
             if (*pattern == '\0') return 1;
+            /* Try matching the rest of the pattern at each position. */
             while (*string) {
-                if (fsGlobMatch(pattern, string)) return 1;
+                if (fsGlobMatchInternal(pattern, string, nocase)) return 1;
                 string++;
             }
-            return fsGlobMatch(pattern, string);
-        } else if (*pattern == '?') {
+            return fsGlobMatchInternal(pattern, string, nocase);
+
+        case '?':
+            /* Match any single character. */
             pattern++;
             string++;
-        } else {
-            if (*pattern != *string) return 0;
+            break;
+
+        case '[': {
+            /* Character class. */
+            pattern++;
+            int negate = 0;
+            if (*pattern == '!' || *pattern == '^') {
+                negate = 1;
+                pattern++;
+            }
+
+            int matched = 0;
+            unsigned char sc = (unsigned char)*string;
+            if (nocase) sc = (unsigned char)tolower(sc);
+
+            /* Empty class "[]" is not valid — treat ']' as first literal
+             * if it appears immediately after '[' or '[!' */
+            while (*pattern && *pattern != ']') {
+                unsigned char lo, hi;
+
+                if (*pattern == '\\' && *(pattern+1)) {
+                    pattern++;
+                    lo = (unsigned char)*pattern;
+                } else {
+                    lo = (unsigned char)*pattern;
+                }
+                if (nocase) lo = (unsigned char)tolower(lo);
+
+                /* Check for range: a-z */
+                if (*(pattern+1) == '-' && *(pattern+2) && *(pattern+2) != ']') {
+                    pattern += 2; /* skip past '-' */
+                    if (*pattern == '\\' && *(pattern+1)) {
+                        pattern++;
+                        hi = (unsigned char)*pattern;
+                    } else {
+                        hi = (unsigned char)*pattern;
+                    }
+                    if (nocase) hi = (unsigned char)tolower(hi);
+
+                    if (lo <= hi) {
+                        if (sc >= lo && sc <= hi) matched = 1;
+                    } else {
+                        /* Reversed range, e.g., [z-a] — match if in either direction. */
+                        if (sc >= hi && sc <= lo) matched = 1;
+                    }
+                } else {
+                    /* Single character match. */
+                    if (sc == lo) matched = 1;
+                }
+                pattern++;
+            }
+
+            if (*pattern == ']') pattern++; /* Skip closing bracket. */
+
+            if (negate) matched = !matched;
+            if (!matched) return 0;
+            string++;
+            break;
+        }
+
+        case '\\':
+            /* Escape: next character is literal. */
+            pattern++;
+            if (*pattern == '\0') return 0;
+            /* Fall through to literal comparison. */
+            /* fallthrough */
+
+        default: {
+            /* Literal character comparison. */
+            unsigned char pc = (unsigned char)*pattern;
+            unsigned char sc = (unsigned char)*string;
+            if (nocase) {
+                pc = (unsigned char)tolower(pc);
+                sc = (unsigned char)tolower(sc);
+            }
+            if (pc != sc) return 0;
             pattern++;
             string++;
+            break;
+        }
         }
     }
 
@@ -174,29 +265,10 @@ int fsGlobMatch(const char *pattern, const char *string) {
     return (*pattern == '\0' && *string == '\0');
 }
 
-/* Case-insensitive glob matching. */
-int fsGlobMatchNoCase(const char *pattern, const char *string) {
-    while (*pattern && *string) {
-        if (*pattern == '*') {
-            pattern++;
-            while (*pattern == '*') pattern++;
-            if (*pattern == '\0') return 1;
-            while (*string) {
-                if (fsGlobMatchNoCase(pattern, string)) return 1;
-                string++;
-            }
-            return fsGlobMatchNoCase(pattern, string);
-        } else if (*pattern == '?') {
-            pattern++;
-            string++;
-        } else {
-            if (tolower((unsigned char)*pattern) != tolower((unsigned char)*string))
-                return 0;
-            pattern++;
-            string++;
-        }
-    }
+int fsGlobMatch(const char *pattern, const char *string) {
+    return fsGlobMatchInternal(pattern, string, 0);
+}
 
-    while (*pattern == '*') pattern++;
-    return (*pattern == '\0' && *string == '\0');
+int fsGlobMatchNoCase(const char *pattern, const char *string) {
+    return fsGlobMatchInternal(pattern, string, 1);
 }

@@ -247,31 +247,68 @@ void fsBloomBuild(fsInode *inode) {
     }
 }
 
-/* Extract the longest literal substring from a glob pattern (strip
- * leading/trailing wildcards and take the first non-wildcard run).
- * Returns length of the literal, sets *start to its offset in pattern.
- * Returns 0 if no useful literal can be extracted. */
-static size_t fsBloomExtractLiteral(const char *pattern, size_t *start) {
-    const char *best = NULL;
+/* Extract the longest literal substring from a glob pattern.
+ * Skips wildcards (*, ?), character classes ([...]), and treats
+ * backslash-escaped characters as their literal value.
+ * Returns the literal in a static buffer via *out, and its length.
+ * Returns 0 if no useful literal (>= 3 chars) can be extracted. */
+static size_t fsBloomExtractLiteral(const char *pattern, const char **out) {
+    static char buf[256];
+    char cur[256];
+    size_t curlen = 0;
     size_t bestlen = 0;
-    const char *p = pattern;
 
+    const char *p = pattern;
     while (*p) {
-        /* Skip wildcards. */
-        while (*p == '*' || *p == '?') p++;
-        if (!*p) break;
-        /* Start of a literal run. */
-        const char *run = p;
-        while (*p && *p != '*' && *p != '?') p++;
-        size_t runlen = (size_t)(p - run);
-        if (runlen > bestlen) {
-            best = run;
-            bestlen = runlen;
+        if (*p == '*' || *p == '?') {
+            /* Wildcard breaks the literal run. */
+            if (curlen > bestlen) {
+                bestlen = curlen;
+                memcpy(buf, cur, curlen);
+            }
+            curlen = 0;
+            p++;
+        } else if (*p == '[') {
+            /* Character class breaks the literal run. */
+            if (curlen > bestlen) {
+                bestlen = curlen;
+                memcpy(buf, cur, curlen);
+            }
+            curlen = 0;
+            /* Skip past the closing ']'. */
+            p++;
+            if (*p == '!' || *p == '^') p++;
+            if (*p == ']') p++; /* literal ']' at start of class */
+            while (*p && *p != ']') {
+                if (*p == '\\' && *(p+1)) p++;
+                p++;
+            }
+            if (*p == ']') p++;
+        } else if (*p == '\\' && *(p+1)) {
+            /* Escaped character is literal. */
+            p++;
+            if (curlen < sizeof(cur) - 1)
+                cur[curlen++] = *p;
+            p++;
+        } else {
+            /* Plain literal character. */
+            if (curlen < sizeof(cur) - 1)
+                cur[curlen++] = *p;
+            p++;
         }
     }
+    /* Check final run. */
+    if (curlen > bestlen) {
+        bestlen = curlen;
+        memcpy(buf, cur, curlen);
+    }
 
-    if (bestlen < 3) return 0; /* Need at least one trigram. */
-    *start = (size_t)(best - pattern);
+    if (bestlen < 3) {
+        *out = NULL;
+        return 0;
+    }
+    buf[bestlen] = '\0';
+    *out = buf;
     return bestlen;
 }
 
@@ -284,11 +321,11 @@ int fsBloomMayMatch(const fsInode *inode, const char *pattern) {
         return 1;
     }
 
-    size_t start;
-    size_t litlen = fsBloomExtractLiteral(pattern, &start);
+    const char *litstr;
+    size_t litlen = fsBloomExtractLiteral(pattern, &litstr);
     if (litlen < 3) return 1; /* No useful literal — must scan. */
 
-    const uint8_t *lit = (const uint8_t *)pattern + start;
+    const uint8_t *lit = (const uint8_t *)litstr;
     for (size_t i = 0; i + 2 < litlen; i++) {
         uint8_t a = fsLowerChar(lit[i]);
         uint8_t b = fsLowerChar(lit[i+1]);
@@ -1987,11 +2024,10 @@ static void fsGrepWalk(fsObject *fs, const char *path, size_t pathlen,
             /* Scan the raw bytes for the pattern's literal substring.
              * We can't do line-by-line glob on binary, so just check if
              * the literal is present anywhere (case-insensitive). */
-            size_t start;
-            size_t litlen = fsBloomExtractLiteral(pattern, &start);
+            const char *lit;
+            size_t litlen = fsBloomExtractLiteral(pattern, &lit);
             int found = 0;
             if (litlen >= 1) {
-                const char *lit = pattern + start;
                 for (size_t i = 0; i + litlen <= size && !found; i++) {
                     size_t j;
                     for (j = 0; j < litlen; j++) {
