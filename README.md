@@ -54,7 +54,7 @@ OK
 | `FS.RM key path [RECURSIVE]` | Delete file or directory |
 | `FS.TOUCH key path` | Create empty file or update timestamps |
 | `FS.MKDIR key path [PARENTS]` | Create directory |
-| `FS.LS key path [LONG]` | List directory contents |
+| `FS.LS key [path] [LONG]` | List directory contents (defaults to /) |
 | `FS.STAT key path` | Get inode metadata |
 | `FS.TEST key path` | Check if path exists |
 | `FS.CHMOD key path mode` | Change permission bits |

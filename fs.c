@@ -1044,10 +1044,16 @@ int FSMkdir_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
  * =================================================================== */
 int FSLs_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     RedisModule_AutoMemory(ctx);
-    if (argc < 3 || argc > 4) return RedisModule_WrongArity(ctx);
+    if (argc < 2 || argc > 4) return RedisModule_WrongArity(ctx);
 
+    /* Parse optional path and LONG flag.
+     * Forms: FS.LS key [path] [LONG] */
     int longformat = 0;
+    const char *rawpath = "/";
+    size_t pathlen = 1;
+
     if (argc == 4) {
+        /* FS.LS key path LONG */
         size_t optlen;
         const char *opt = RedisModule_StringPtrLen(argv[3], &optlen);
         if (optlen == 4 && strncasecmp(opt, "LONG", 4) == 0) {
@@ -1055,15 +1061,24 @@ int FSLs_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         } else {
             return RedisModule_ReplyWithError(ctx, "ERR syntax error — expected LONG");
         }
+        rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
+    } else if (argc == 3) {
+        /* FS.LS key <path|LONG> */
+        size_t arglen;
+        const char *arg = RedisModule_StringPtrLen(argv[2], &arglen);
+        if (arglen == 4 && strncasecmp(arg, "LONG", 4) == 0) {
+            longformat = 1;  /* path stays "/" */
+        } else {
+            rawpath = arg;
+            pathlen = arglen;
+        }
     }
+    /* argc == 2: FS.LS key — path defaults to "/" */
 
     RedisModuleKey *key;
     fsObject *fs = fsGetObject(ctx, argv[1], REDISMODULE_READ, &key);
     if (!key) return REDISMODULE_OK;
     if (!fs) return RedisModule_ReplyWithError(ctx, "ERR no such filesystem key");
-
-    size_t pathlen;
-    const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
     char *path = fsNormalizePath(rawpath, pathlen);
     size_t npathlen = strlen(path);
 

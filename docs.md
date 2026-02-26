@@ -94,6 +94,7 @@ and merged `rm` and `rmdir` into one command.
 | `rmdir dir` | `FS.RM key /dir` | Fails if not empty (use RECURSIVE) |
 | `mkdir dir` | `FS.MKDIR key /dir` | Parent must exist |
 | `mkdir -p a/b/c` | `FS.MKDIR key /a/b/c PARENTS` | Creates intermediates |
+| `ls` | `FS.LS key` | Lists root directory |
 | `ls dir` | `FS.LS key /dir` | Returns child names |
 | `ls -l dir` | `FS.LS key /dir LONG` | Includes type, mode, size, mtime |
 | `stat file` | `FS.STAT key /file` | Full metadata: type, mode, uid, gid, times |
@@ -332,16 +333,17 @@ Time complexity: O(d) where d is the path depth.
 
 **FS.LS: list directory contents**
 
-    FS.LS key path [LONG]
+    FS.LS key [path] [LONG]
 
-Returns the names of entries in a directory. Follows symlinks on the
-directory path itself (so if `/link` points to `/realdir`, `FS.LS key /link`
-lists the contents of `/realdir`).
+Returns the names of entries in a directory. If `path` is omitted,
+lists the root directory `/`. Follows symlinks on the directory path
+itself (so if `/link` points to `/realdir`, `FS.LS key /link` lists
+the contents of `/realdir`).
 
 Without `LONG`, returns a simple array of names. With `LONG`, each
 entry is a 5-element array: `[name, type, mode, size, mtime]`.
 
-    > FS.LS myfs /
+    > FS.LS myfs
     1) "config.json"
     2) "docs"
     3) "log.txt"
