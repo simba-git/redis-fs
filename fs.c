@@ -1975,40 +1975,76 @@ static void fsGrepWalk(fsObject *fs, const char *path, size_t pathlen,
          * for both case-sensitive and case-insensitive grep. */
         if (!fsBloomMayMatch(inode, pattern)) goto recurse;
 
-        /* Search line by line. */
         const char *data = inode->payload.file.data;
         size_t size = inode->payload.file.size;
-        int lineno = 1;
-        size_t pos = 0;
 
-        while (pos < size) {
-            /* Find line end. */
-            size_t linestart = pos;
-            while (pos < size && data[pos] != '\n') pos++;
-            size_t linelen = pos - linestart;
-            if (pos < size) pos++; /* skip newline */
+        /* Binary file detection: check for NUL bytes (same heuristic as
+         * GNU grep). If binary, report "Binary file matches" instead of
+         * dumping raw content. */
+        int is_binary = (memchr(data, '\0', size) != NULL);
 
-            /* Extract line as null-terminated string. */
-            char *line = RedisModule_Alloc(linelen + 1);
-            memcpy(line, data + linestart, linelen);
-            line[linelen] = '\0';
-
-            int match;
-            if (nocase)
-                match = fsGlobMatchNoCase(pattern, line);
-            else
-                match = fsGlobMatch(pattern, line);
-
-            if (match) {
+        if (is_binary) {
+            /* Scan the raw bytes for the pattern's literal substring.
+             * We can't do line-by-line glob on binary, so just check if
+             * the literal is present anywhere (case-insensitive). */
+            size_t start;
+            size_t litlen = fsBloomExtractLiteral(pattern, &start);
+            int found = 0;
+            if (litlen >= 1) {
+                const char *lit = pattern + start;
+                for (size_t i = 0; i + litlen <= size && !found; i++) {
+                    size_t j;
+                    for (j = 0; j < litlen; j++) {
+                        uint8_t a = fsLowerChar((uint8_t)data[i+j]);
+                        uint8_t b = fsLowerChar((uint8_t)lit[j]);
+                        if (a != b) break;
+                    }
+                    if (j == litlen) found = 1;
+                }
+            } else {
+                found = 1; /* Pure wildcard pattern — assume match. */
+            }
+            if (found) {
                 RedisModule_ReplyWithArray(ctx, 3);
                 RedisModule_ReplyWithCString(ctx, path);
-                RedisModule_ReplyWithLongLong(ctx, lineno);
-                RedisModule_ReplyWithStringBuffer(ctx, line, linelen);
+                RedisModule_ReplyWithLongLong(ctx, 0);
+                RedisModule_ReplyWithCString(ctx, "Binary file matches");
                 (*count)++;
             }
+        } else {
+            /* Text file: search line by line. */
+            int lineno = 1;
+            size_t pos = 0;
 
-            RedisModule_Free(line);
-            lineno++;
+            while (pos < size) {
+                /* Find line end. */
+                size_t linestart = pos;
+                while (pos < size && data[pos] != '\n') pos++;
+                size_t linelen = pos - linestart;
+                if (pos < size) pos++; /* skip newline */
+
+                /* Extract line as null-terminated string. */
+                char *line = RedisModule_Alloc(linelen + 1);
+                memcpy(line, data + linestart, linelen);
+                line[linelen] = '\0';
+
+                int match;
+                if (nocase)
+                    match = fsGlobMatchNoCase(pattern, line);
+                else
+                    match = fsGlobMatch(pattern, line);
+
+                if (match) {
+                    RedisModule_ReplyWithArray(ctx, 3);
+                    RedisModule_ReplyWithCString(ctx, path);
+                    RedisModule_ReplyWithLongLong(ctx, lineno);
+                    RedisModule_ReplyWithStringBuffer(ctx, line, linelen);
+                    (*count)++;
+                }
+
+                RedisModule_Free(line);
+                lineno++;
+            }
         }
     }
 
