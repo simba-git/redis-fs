@@ -55,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 
 // Module type handle.
 RedisModuleType *FSType = NULL;
@@ -74,6 +75,43 @@ static void fsFindWalk(fsObject *fs, const char *path, size_t pathlen,
 static void fsGrepWalk(fsObject *fs, const char *path, size_t pathlen,
                        const char *pattern, int nocase,
                        RedisModuleCtx *ctx, long *count);
+
+#define FS_RESOLVE_OK 0
+#define FS_RESOLVE_ERR_SYMLINK_LOOP 1
+#define FS_RESOLVE_ERR_PATH_DEPTH 2
+
+static char *fsNormalizeOrReply(RedisModuleCtx *ctx, const char *path, size_t pathlen) {
+    char *normalized = fsNormalizePath(path, pathlen);
+    if (!normalized) {
+        RedisModule_ReplyWithError(ctx, "ERR path depth exceeds limit");
+    }
+    return normalized;
+}
+
+static int fsParseModeStrict(const char *modestr, size_t modelen, uint16_t *mode_out) {
+    if (modelen == 0 || modelen >= 16) return REDISMODULE_ERR;
+
+    char modebuf[16];
+    memcpy(modebuf, modestr, modelen);
+    modebuf[modelen] = '\0';
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(modebuf, &end, 8);
+    if (errno != 0 || end == modebuf || *end != '\0' || parsed > 07777) {
+        return REDISMODULE_ERR;
+    }
+
+    *mode_out = (uint16_t)parsed;
+    return REDISMODULE_OK;
+}
+
+static int fsPathHasPrefix(const char *path, size_t pathlen,
+                           const char *prefix, size_t prefixlen) {
+    if (pathlen < prefixlen) return 0;
+    if (memcmp(path, prefix, prefixlen) != 0) return 0;
+    return pathlen == prefixlen || path[prefixlen] == '/';
+}
 
 /* ===================================================================
  * Inode lifecycle
@@ -432,7 +470,7 @@ static fsInode *fsRemove(fsObject *fs, const char *path, size_t pathlen) {
 }
 
 char *fsResolvePath(fsObject *fs, const char *path, size_t pathlen, int *err) {
-    *err = 0;
+    *err = FS_RESOLVE_OK;
     char *current = RedisModule_Alloc(pathlen + 1);
     memcpy(current, path, pathlen);
     current[pathlen] = '\0';
@@ -458,13 +496,18 @@ char *fsResolvePath(fsObject *fs, const char *path, size_t pathlen, int *err) {
             resolved = fsJoinPath(parent, strlen(parent), target, tlen);
             RedisModule_Free(parent);
         }
+        if (!resolved) {
+            RedisModule_Free(current);
+            *err = FS_RESOLVE_ERR_PATH_DEPTH;
+            return NULL;
+        }
         RedisModule_Free(current);
         current = resolved;
     }
 
     // Too many levels of symlinks.
     RedisModule_Free(current);
-    *err = 1;
+    *err = FS_RESOLVE_ERR_SYMLINK_LOOP;
     return NULL;
 }
 
@@ -853,7 +896,8 @@ static int ECHO_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     size_t npathlen = strlen(path);
 
     if (fsIsRoot(path, npathlen)) {
@@ -925,13 +969,17 @@ static int CAT_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int a
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     // Resolve symlinks.
     int err;
     char *resolved = fsResolvePath(fs, path, strlen(path), &err);
     RedisModule_Free(path);
-    if (err) return RedisModule_ReplyWithError(ctx, "ERR too many levels of symbolic links");
+    if (err == FS_RESOLVE_ERR_SYMLINK_LOOP)
+        return RedisModule_ReplyWithError(ctx, "ERR too many levels of symbolic links");
+    if (err == FS_RESOLVE_ERR_PATH_DEPTH)
+        return RedisModule_ReplyWithError(ctx, "ERR path depth exceeds limit");
 
     fsInode *inode = fsLookup(fs, resolved, strlen(resolved));
     RedisModule_Free(resolved);
@@ -967,7 +1015,8 @@ static int APPEND_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, in
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     size_t npathlen = strlen(path);
 
     if (fsIsRoot(path, npathlen)) {
@@ -1047,6 +1096,10 @@ static int fsDeleteRecursive(fsObject *fs, const char *path, size_t pathlen) {
         for (size_t i = 0; i < nchildren; i++) {
             char *childpath = fsJoinPath(path, pathlen,
                                           children_copy[i], strlen(children_copy[i]));
+            if (!childpath) {
+                RedisModule_Free(children_copy[i]);
+                continue;
+            }
             fsDeleteRecursive(fs, childpath, strlen(childpath));
             RedisModule_Free(childpath);
             RedisModule_Free(children_copy[i]);
@@ -1098,7 +1151,8 @@ static int RM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     size_t npathlen = strlen(path);
 
     if (fsIsRoot(path, npathlen)) {
@@ -1161,7 +1215,8 @@ static int TOUCH_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     size_t npathlen = strlen(path);
 
     if (fsEnsureParents(fs, path, npathlen) != 0) {
@@ -1220,7 +1275,8 @@ static int MKDIR_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     size_t npathlen = strlen(path);
 
     // Check if already exists.
@@ -1313,14 +1369,18 @@ static int LS_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
     fsObject *fs = fsGetObject(ctx, argv[1], REDISMODULE_READ, &key);
     if (!key) return REDISMODULE_OK;
     if (!fs) return RedisModule_ReplyWithError(ctx, "ERR no such filesystem key");
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     size_t npathlen = strlen(path);
 
     // Resolve symlinks.
     int err;
     char *resolved = fsResolvePath(fs, path, npathlen, &err);
     RedisModule_Free(path);
-    if (err) return RedisModule_ReplyWithError(ctx, "ERR too many levels of symbolic links");
+    if (err == FS_RESOLVE_ERR_SYMLINK_LOOP)
+        return RedisModule_ReplyWithError(ctx, "ERR too many levels of symbolic links");
+    if (err == FS_RESOLVE_ERR_PATH_DEPTH)
+        return RedisModule_ReplyWithError(ctx, "ERR path depth exceeds limit");
 
     fsInode *dir = fsLookup(fs, resolved, strlen(resolved));
     if (!dir) {
@@ -1346,6 +1406,15 @@ static int LS_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
             char *childpath = fsJoinPath(resolved, strlen(resolved),
                                           dir->payload.dir.children[i],
                                           strlen(dir->payload.dir.children[i]));
+            if (!childpath) {
+                RedisModule_ReplyWithArray(ctx, 5);
+                RedisModule_ReplyWithCString(ctx, dir->payload.dir.children[i]);
+                RedisModule_ReplyWithCString(ctx, "unknown");
+                RedisModule_ReplyWithCString(ctx, "0000");
+                RedisModule_ReplyWithLongLong(ctx, 0);
+                RedisModule_ReplyWithLongLong(ctx, 0);
+                continue;
+            }
             fsInode *child = fsLookup(fs, childpath, strlen(childpath));
             RedisModule_Free(childpath);
 
@@ -1395,7 +1464,8 @@ static int STAT_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     fsInode *inode = fsLookup(fs, path, strlen(path));
     RedisModule_Free(path);
@@ -1461,7 +1531,8 @@ static int TEST_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     fsInode *inode = fsLookup(fs, path, strlen(path));
     RedisModule_Free(path);
 
@@ -1485,7 +1556,8 @@ static int CHMOD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     fsInode *inode = fsLookup(fs, path, strlen(path));
     RedisModule_Free(path);
@@ -1493,14 +1565,11 @@ static int CHMOD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int
 
     size_t modelen;
     const char *modestr = RedisModule_StringPtrLen(argv[3], &modelen);
-    unsigned int mode;
-    // Try octal parse first.
-    char modebuf[16];
-    if (modelen >= sizeof(modebuf)) modelen = sizeof(modebuf) - 1;
-    memcpy(modebuf, modestr, modelen);
-    modebuf[modelen] = '\0';
-    mode = (unsigned int)strtol(modebuf, NULL, 8);
-    inode->mode = mode & 07777;
+    uint16_t mode;
+    if (fsParseModeStrict(modestr, modelen, &mode) != REDISMODULE_OK) {
+        return RedisModule_ReplyWithError(ctx, "ERR mode must be an octal value between 0000 and 07777");
+    }
+    inode->mode = mode;
 
     RedisModule_ReplyWithSimpleString(ctx, "OK");
     RedisModule_ReplicateVerbatim(ctx);
@@ -1523,7 +1592,8 @@ static int CHOWN_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     fsInode *inode = fsLookup(fs, path, strlen(path));
     RedisModule_Free(path);
@@ -1533,12 +1603,18 @@ static int CHOWN_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int
     if (RedisModule_StringToLongLong(argv[3], &uid_val) != REDISMODULE_OK) {
         return RedisModule_ReplyWithError(ctx, "ERR uid must be an integer");
     }
+    if (uid_val < 0 || uid_val > UINT32_MAX) {
+        return RedisModule_ReplyWithError(ctx, "ERR uid out of range");
+    }
     inode->uid = (uint32_t)uid_val;
 
     if (argc == 5) {
         long long gid_val;
         if (RedisModule_StringToLongLong(argv[4], &gid_val) != REDISMODULE_OK) {
             return RedisModule_ReplyWithError(ctx, "ERR gid must be an integer");
+        }
+        if (gid_val < 0 || gid_val > UINT32_MAX) {
+            return RedisModule_ReplyWithError(ctx, "ERR gid out of range");
         }
         inode->gid = (uint32_t)gid_val;
     }
@@ -1567,7 +1643,8 @@ static int LN_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
 
     size_t linkpathlen;
     const char *rawlinkpath = RedisModule_StringPtrLen(argv[3], &linkpathlen);
-    char *linkpath = fsNormalizePath(rawlinkpath, linkpathlen);
+    char *linkpath = fsNormalizeOrReply(ctx, rawlinkpath, linkpathlen);
+    if (!linkpath) return REDISMODULE_OK;
     size_t nlinklen = strlen(linkpath);
 
     if (fsIsRoot(linkpath, nlinklen)) {
@@ -1623,7 +1700,8 @@ static int READLINK_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     fsInode *inode = fsLookup(fs, path, strlen(path));
     RedisModule_Free(path);
@@ -1649,6 +1727,9 @@ static int fsCopyRecursive(fsObject *fs, const char *src, size_t srclen,
         fsInode *newinode = fsInodeCreate(FS_INODE_FILE, sinode->mode);
         newinode->uid = sinode->uid;
         newinode->gid = sinode->gid;
+        newinode->ctime = sinode->ctime;
+        newinode->mtime = sinode->mtime;
+        newinode->atime = sinode->atime;
         if (sinode->payload.file.size > 0) {
             fsFileSetData(newinode, sinode->payload.file.data, sinode->payload.file.size);
         }
@@ -1659,6 +1740,9 @@ static int fsCopyRecursive(fsObject *fs, const char *src, size_t srclen,
         fsInode *newdir = fsInodeCreate(FS_INODE_DIR, sinode->mode);
         newdir->uid = sinode->uid;
         newdir->gid = sinode->gid;
+        newdir->ctime = sinode->ctime;
+        newdir->mtime = sinode->mtime;
+        newdir->atime = sinode->atime;
         fsInsert(fs, dst, dstlen, newdir);
 
         for (size_t i = 0; i < sinode->payload.dir.count; i++) {
@@ -1666,14 +1750,28 @@ static int fsCopyRecursive(fsObject *fs, const char *src, size_t srclen,
             size_t cnamelen = strlen(childname);
             char *srcc = fsJoinPath(src, srclen, childname, cnamelen);
             char *dstc = fsJoinPath(dst, dstlen, childname, cnamelen);
+            if (!srcc || !dstc) {
+                if (srcc) RedisModule_Free(srcc);
+                if (dstc) RedisModule_Free(dstc);
+                return -1;
+            }
             fsDirAddChild(newdir, childname, cnamelen);
-            fsCopyRecursive(fs, srcc, strlen(srcc), dstc, strlen(dstc));
+            if (fsCopyRecursive(fs, srcc, strlen(srcc), dstc, strlen(dstc)) != 0) {
+                RedisModule_Free(srcc);
+                RedisModule_Free(dstc);
+                return -1;
+            }
             RedisModule_Free(srcc);
             RedisModule_Free(dstc);
         }
         return 0;
     } else if (sinode->type == FS_INODE_SYMLINK) {
         fsInode *newlink = fsInodeCreate(FS_INODE_SYMLINK, sinode->mode);
+        newlink->uid = sinode->uid;
+        newlink->gid = sinode->gid;
+        newlink->ctime = sinode->ctime;
+        newlink->mtime = sinode->mtime;
+        newlink->atime = sinode->atime;
         char *target = sinode->payload.symlink.target;
         size_t tlen = strlen(target);
         newlink->payload.symlink.target = RedisModule_Alloc(tlen + 1);
@@ -1705,12 +1803,17 @@ static int CP_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
 
     size_t srclen;
     const char *rawsrc = RedisModule_StringPtrLen(argv[2], &srclen);
-    char *src = fsNormalizePath(rawsrc, srclen);
+    char *src = fsNormalizeOrReply(ctx, rawsrc, srclen);
+    if (!src) return REDISMODULE_OK;
     size_t nsrclen = strlen(src);
 
     size_t dstlen;
     const char *rawdst = RedisModule_StringPtrLen(argv[3], &dstlen);
-    char *dst = fsNormalizePath(rawdst, dstlen);
+    char *dst = fsNormalizeOrReply(ctx, rawdst, dstlen);
+    if (!dst) {
+        RedisModule_Free(src);
+        return REDISMODULE_OK;
+    }
     size_t ndstlen = strlen(dst);
 
     fsInode *sinode = fsLookup(fs, src, nsrclen);
@@ -1738,7 +1841,11 @@ static int CP_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
         return RedisModule_ReplyWithError(ctx, "ERR destination parent path conflict");
     }
 
-    fsCopyRecursive(fs, src, nsrclen, dst, ndstlen);
+    if (fsCopyRecursive(fs, src, nsrclen, dst, ndstlen) != 0) {
+        RedisModule_Free(src);
+        RedisModule_Free(dst);
+        return RedisModule_ReplyWithError(ctx, "ERR copy failed");
+    }
 
     // Add to parent's children.
     char *parent = fsParentPath(dst, ndstlen);
@@ -1774,12 +1881,17 @@ static int MV_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
 
     size_t srclen;
     const char *rawsrc = RedisModule_StringPtrLen(argv[2], &srclen);
-    char *src = fsNormalizePath(rawsrc, srclen);
+    char *src = fsNormalizeOrReply(ctx, rawsrc, srclen);
+    if (!src) return REDISMODULE_OK;
     size_t nsrclen = strlen(src);
 
     size_t dstlen;
     const char *rawdst = RedisModule_StringPtrLen(argv[3], &dstlen);
-    char *dst = fsNormalizePath(rawdst, dstlen);
+    char *dst = fsNormalizeOrReply(ctx, rawdst, dstlen);
+    if (!dst) {
+        RedisModule_Free(src);
+        return REDISMODULE_OK;
+    }
     size_t ndstlen = strlen(dst);
 
     if (fsIsRoot(src, nsrclen)) {
@@ -1799,6 +1911,12 @@ static int MV_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
         RedisModule_Free(src);
         RedisModule_Free(dst);
         return RedisModule_ReplyWithError(ctx, "ERR destination already exists");
+    }
+
+    if (sinode->type == FS_INODE_DIR && fsPathHasPrefix(dst, ndstlen, src, nsrclen)) {
+        RedisModule_Free(src);
+        RedisModule_Free(dst);
+        return RedisModule_ReplyWithError(ctx, "ERR cannot move a directory into its own subtree");
     }
 
     if (fsEnsureParents(fs, dst, ndstlen) != 0) {
@@ -1953,6 +2071,7 @@ static void fsTreeReply(RedisModuleCtx *ctx, fsObject *fs,
         char *childpath = fsJoinPath(path, pathlen,
                                       inode->payload.dir.children[i],
                                       strlen(inode->payload.dir.children[i]));
+        if (!childpath) continue;
         fsTreeReply(ctx, fs, childpath, strlen(childpath), depth + 1, maxdepth);
         RedisModule_Free(childpath);
     }
@@ -1983,7 +2102,8 @@ static int TREE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     fsInode *inode = fsLookup(fs, path, strlen(path));
     if (!inode) {
@@ -2025,6 +2145,7 @@ static void fsFindWalk(fsObject *fs, const char *path, size_t pathlen,
             char *childpath = fsJoinPath(path, pathlen,
                                           inode->payload.dir.children[i],
                                           strlen(inode->payload.dir.children[i]));
+            if (!childpath) continue;
             fsFindWalk(fs, childpath, strlen(childpath), pattern, typefilter, ctx, count);
             RedisModule_Free(childpath);
         }
@@ -2056,7 +2177,8 @@ static int FIND_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     size_t patternlen;
     const char *pattern = RedisModule_StringPtrLen(argv[3], &patternlen);
@@ -2167,6 +2289,7 @@ recurse:
             char *childpath = fsJoinPath(path, pathlen,
                                           inode->payload.dir.children[i],
                                           strlen(inode->payload.dir.children[i]));
+            if (!childpath) continue;
             fsGrepWalk(fs, childpath, strlen(childpath), pattern, nocase, ctx, count);
             RedisModule_Free(childpath);
         }
@@ -2194,7 +2317,8 @@ static int GREP_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     size_t patternlen;
     const char *pattern = RedisModule_StringPtrLen(argv[3], &patternlen);
@@ -2224,14 +2348,18 @@ static int TRUNCATE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, 
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
     size_t npathlen = strlen(path);
 
     // Resolve symlinks.
     int err;
     char *resolved = fsResolvePath(fs, path, npathlen, &err);
     RedisModule_Free(path);
-    if (err) return RedisModule_ReplyWithError(ctx, "ERR too many levels of symbolic links");
+    if (err == FS_RESOLVE_ERR_SYMLINK_LOOP)
+        return RedisModule_ReplyWithError(ctx, "ERR too many levels of symbolic links");
+    if (err == FS_RESOLVE_ERR_PATH_DEPTH)
+        return RedisModule_ReplyWithError(ctx, "ERR path depth exceeds limit");
 
     fsInode *inode = fsLookup(fs, resolved, strlen(resolved));
     if (!inode) {
@@ -2299,7 +2427,8 @@ static int UTIMENS_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, i
 
     size_t pathlen;
     const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
-    char *path = fsNormalizePath(rawpath, pathlen);
+    char *path = fsNormalizeOrReply(ctx, rawpath, pathlen);
+    if (!path) return REDISMODULE_OK;
 
     fsInode *inode = fsLookup(fs, path, strlen(path));
     RedisModule_Free(path);

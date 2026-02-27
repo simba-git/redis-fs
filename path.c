@@ -7,12 +7,15 @@
 #include <string.h>
 #include <ctype.h>
 
+#define FS_NORMALIZE_MAX_DEPTH 256
+
 /* Normalize a path to absolute form. Resolves ".", "..", multiple slashes.
  * Always returns a path starting with '/'. */
 char *fsNormalizePath(const char *path, size_t len) {
     // Stack of component start positions and lengths.
-    struct { size_t start; size_t len; } parts[256];
+    struct { size_t start; size_t len; } parts[FS_NORMALIZE_MAX_DEPTH];
     int depth = 0;
+    int overflow = 0;
 
     if (len == 0 || path[0] != '/') {
         // Treat relative path as absolute from root.
@@ -37,12 +40,18 @@ char *fsNormalizePath(const char *path, size_t len) {
             // Parent dir.
             if (depth > 0) depth--;
         } else {
-            if (depth < 256) {
+            if (depth < FS_NORMALIZE_MAX_DEPTH) {
                 parts[depth].start = start;
                 parts[depth].len = clen;
                 depth++;
+            } else {
+                overflow = 1;
             }
         }
+    }
+
+    if (overflow) {
+        return NULL;
     }
 
     if (depth == 0) {

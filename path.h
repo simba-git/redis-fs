@@ -13,7 +13,8 @@
 
 /* Normalize a path: resolve ".", "..", collapse multiple slashes,
  * remove trailing slash (except for root "/").
- * Returns a newly allocated string. */
+ * Returns a newly allocated string, or NULL if path depth exceeds 256
+ * components. */
 char *fsNormalizePath(const char *path, size_t len);
 
 /* Return the parent directory of the given path.
