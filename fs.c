@@ -52,7 +52,6 @@
 #include "fs.h"
 #include "path.h"
 #include <string.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>

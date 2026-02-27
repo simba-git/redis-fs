@@ -9,14 +9,13 @@
 #ifndef REDIS_FS_H
 #define REDIS_FS_H
 
-/* POSIX feature test macros — must come before any system headers. */
-#define _POSIX_C_SOURCE 199309L
-#define _DEFAULT_SOURCE
-
-#include "redismodule.h"
+/* System headers first (POSIX macros defined via compiler flags) */
+#include <stdio.h>
 #include <stdint.h>
 #include <strings.h>
 #include <time.h>
+
+#include "redismodule.h"
 
 /* Inode types. */
 #define FS_INODE_FILE    0
