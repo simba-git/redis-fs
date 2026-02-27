@@ -94,36 +94,36 @@ key as the first argument. We dropped concepts that don't make sense
 server-side (like `cd` and `pwd`, which are stateful client concerns)
 and merged `rm` and `rmdir` into one command.
 
-| Unix command | Redis command | Notes |
-|---|---|---|
-| `cat file` | `FS.CAT key /file` | Follows symlinks |
-| `echo "text" > file` | `FS.ECHO key /file "text"` | Creates parents automatically |
-| `echo "text" >> file` | `FS.APPEND key /file "text"` | Creates file if missing |
-| `touch file` | `FS.TOUCH key /file` | Creates or updates mtime |
-| `rm file` | `FS.RM key /file` | Works on files, dirs, symlinks |
-| `rm -r dir` | `FS.RM key /dir RECURSIVE` | Deletes entire subtree |
-| `rmdir dir` | `FS.RM key /dir` | Fails if not empty (use RECURSIVE) |
-| `mkdir dir` | `FS.MKDIR key /dir` | Parent must exist |
-| `mkdir -p a/b/c` | `FS.MKDIR key /a/b/c PARENTS` | Creates intermediates |
-| `ls` | `FS.LS key` | Lists root directory |
-| `ls dir` | `FS.LS key /dir` | Returns child names |
-| `ls -l dir` | `FS.LS key /dir LONG` | Includes type, mode, size, mtime |
-| `stat file` | `FS.STAT key /file` | Full metadata: type, mode, uid, gid, times |
-| `test -e file` | `FS.TEST key /file` | Returns 1 or 0 |
-| `chmod 0755 file` | `FS.CHMOD key /file 0755` | Octal mode string |
-| `chown uid:gid file` | `FS.CHOWN key /file uid gid` | Separate uid and gid args |
-| `ln -s target link` | `FS.LN key /target /link` | Target can be relative or absolute |
-| `readlink link` | `FS.READLINK key /link` | Returns raw target string |
-| `cp src dst` | `FS.CP key /src /dst` | Files only without RECURSIVE |
-| `cp -r src dst` | `FS.CP key /src /dst RECURSIVE` | Deep copy with metadata |
-| `mv src dst` | `FS.MV key /src /dst` | Moves entire subtrees atomically |
-| `tree dir` | `FS.TREE key /dir` | Nested array structure |
-| `tree -L 2 dir` | `FS.TREE key /dir DEPTH 2` | Limits recursion depth |
-| `find dir -name "*.txt"` | `FS.FIND key /dir "*.txt"` | Full glob: `*`, `?`, `[a-z]`, `[!x]`, `\` |
-| `find dir -name "*.txt" -type f` | `FS.FIND key /dir "*.txt" TYPE file` | Filter by type |
-| `grep -r "pattern" dir` | `FS.GREP key /dir "*pattern*"` | Glob match on each line, bloom-accelerated |
-| `grep -ri "pattern" dir` | `FS.GREP key /dir "*pattern*" NOCASE` | Case-insensitive |
-| `df` / `du` | `FS.INFO key` | File/dir/symlink counts + total bytes |
+| Unix command                   | Redis command                      | Notes                                      |
+|--------------------------------|------------------------------------|--------------------------------------------|
+| cat file                       | FS.CAT key /file                   | Follows symlinks                           |
+| echo "text" > file             | FS.ECHO key /file "text"           | Creates parents automatically              |
+| echo "text" >> file            | FS.ECHO key /file "text" APPEND    | Creates file if missing; also FS.APPEND    |
+| touch file                     | FS.TOUCH key /file                 | Creates or updates mtime                   |
+| rm file                        | FS.RM key /file                    | Works on files, dirs, symlinks             |
+| rm -r dir                      | FS.RM key /dir RECURSIVE           | Deletes entire subtree                     |
+| rmdir dir                      | FS.RM key /dir                     | Fails if not empty (use RECURSIVE)         |
+| mkdir dir                      | FS.MKDIR key /dir                  | Parent must exist                          |
+| mkdir -p a/b/c                 | FS.MKDIR key /a/b/c PARENTS        | Creates intermediates                      |
+| ls                             | FS.LS key                          | Lists root directory                       |
+| ls dir                         | FS.LS key /dir                     | Returns child names                        |
+| ls -l dir                      | FS.LS key /dir LONG                | Includes type, mode, size, mtime           |
+| stat file                      | FS.STAT key /file                  | Full metadata: type, mode, uid, gid, times |
+| test -e file                   | FS.TEST key /file                  | Returns 1 or 0                             |
+| chmod 0755 file                | FS.CHMOD key /file 0755            | Octal mode string                          |
+| chown uid:gid file             | FS.CHOWN key /file uid gid         | Separate uid and gid args                  |
+| ln -s target link              | FS.LN key /target /link            | Target can be relative or absolute         |
+| readlink link                  | FS.READLINK key /link              | Returns raw target string                  |
+| cp src dst                     | FS.CP key /src /dst                | Files only without RECURSIVE               |
+| cp -r src dst                  | FS.CP key /src /dst RECURSIVE      | Deep copy with metadata                    |
+| mv src dst                     | FS.MV key /src /dst                | Moves entire subtrees atomically           |
+| tree dir                       | FS.TREE key /dir                   | Nested array structure                     |
+| tree -L 2 dir                  | FS.TREE key /dir DEPTH 2           | Limits recursion depth                     |
+| find dir -name "*.txt"         | FS.FIND key /dir "*.txt"           | Full glob: *, ?, [a-z], [!x], \            |
+| find dir -name "*.txt" -type f | FS.FIND key /dir "*.txt" TYPE file | Filter by type                             |
+| grep -r "pattern" dir          | FS.GREP key /dir "*pattern*"       | Glob match on each line, bloom-accelerated |
+| grep -ri "pattern" dir         | FS.GREP key /dir "*pattern*" NOCASE| Case-insensitive                           |
+| df / du                        | FS.INFO key                        | File/dir/symlink counts + total bytes      |
 
 ## Data model
 
@@ -206,7 +206,7 @@ command is always O(1).
 
 **FS.ECHO: write a file**
 
-    FS.ECHO key path content
+    FS.ECHO key path content [APPEND]
 
 Creates or overwrites a file at the given path. The content is stored
 as a binary-safe string — you can write text, JSON, binary blobs,
@@ -217,6 +217,10 @@ If parent directories don't exist, they're created automatically
 is a file, its content is replaced. If it exists but is a directory
 or symlink, an error is returned.
 
+With `APPEND`, content is appended to an existing file instead of
+overwriting it. If the file doesn't exist, it is created (same as
+without `APPEND`). This is the equivalent of shell `echo >>`.
+
     > FS.ECHO myfs /config.json '{"port": 8080}'
     OK
 
@@ -225,6 +229,13 @@ or symlink, an error is returned.
 
     > FS.LS myfs /deep/nested/path
     1) "file.txt"
+
+    > FS.ECHO myfs /log.txt "line 1\n"
+    OK
+    > FS.ECHO myfs /log.txt "line 2\n" APPEND
+    OK
+    > FS.CAT myfs /log.txt
+    "line 1\nline 2\n"
 
 The command is O(d) where d is the path depth, due to parent creation.
 
@@ -257,6 +268,9 @@ Appends content to an existing file, or creates a new file if the
 path doesn't exist. Returns the new total size in bytes.
 
 Parent directories are created automatically, same as `FS.ECHO`.
+
+Note: `FS.ECHO key path content APPEND` provides the same append
+functionality. `FS.APPEND` is retained for backward compatibility.
 
     > FS.ECHO myfs /log.txt "line 1\n"
     OK
@@ -640,15 +654,15 @@ Both `FS.FIND` and `FS.GREP` use the same glob matcher, modeled after
 Redis's `stringmatchlen()` and POSIX `fnmatch()` semantics. The
 supported syntax is:
 
-| Pattern | Meaning | Example |
-|---|---|---|
-| `*` | Zero or more characters | `*.txt` matches `README.txt` |
-| `?` | Exactly one character | `file?.log` matches `file1.log` |
-| `[abc]` | One of the listed characters | `[Mm]akefile` matches `Makefile` or `makefile` |
-| `[a-z]` | Character in range (inclusive) | `[0-9]*` matches names starting with a digit |
-| `[!abc]` | Any character NOT in the set | `*.[!o]` matches any extension except `.o` |
-| `[^abc]` | Same as `[!abc]` | Alternate negation syntax |
-| `\x` | Literal character x | `file\*` matches the literal filename `file*` |
+| Pattern  | Meaning                       | Example                                       |
+|----------|-------------------------------|-----------------------------------------------|
+| `*`      | Zero or more characters       | `*.txt` matches `README.txt`                  |
+| `?`      | Exactly one character         | `file?.log` matches `file1.log`               |
+| `[abc]`  | One of the listed characters  | `[Mm]akefile` matches `Makefile` or `makefile` |
+| `[a-z]`  | Character in range (inclusive) | `[0-9]*` matches names starting with a digit  |
+| `[!abc]` | Any character NOT in the set  | `*.[!o]` matches any extension except `.o`    |
+| `[^abc]` | Same as `[!abc]`              | Alternate negation syntax                     |
+| `\x`     | Literal character x           | `file\*` matches the literal filename `file*` |
 
 Character classes can contain ranges and individual characters mixed
 together: `[a-zA-Z_]` matches any letter or underscore. Ranges work in

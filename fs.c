@@ -827,13 +827,24 @@ static int INFO_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 }
 
 /* ===================================================================
- * FS.ECHO key path content
+ * FS.ECHO key path content [APPEND]
  *
  * Write (create or overwrite) a file. Creates parent dirs automatically.
+ * With APPEND, appends to an existing file instead of overwriting.
  * =================================================================== */
 static int ECHO_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     RedisModule_AutoMemory(ctx);
-    if (argc != 4) return RedisModule_WrongArity(ctx);
+    if (argc < 4 || argc > 5) return RedisModule_WrongArity(ctx);
+
+    int append = 0;
+    if (argc == 5) {
+        const char *opt = RedisModule_StringPtrLen(argv[4], NULL);
+        if (!strcasecmp(opt, "APPEND")) {
+            append = 1;
+        } else {
+            return RedisModule_ReplyWithError(ctx, "ERR syntax error — expected APPEND");
+        }
+    }
 
     RedisModuleKey *key;
     fsObject *fs = fsGetObject(ctx, argv[1], REDISMODULE_READ|REDISMODULE_WRITE, &key);
@@ -865,9 +876,14 @@ static int ECHO_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
             RedisModule_Free(path);
             return RedisModule_ReplyWithError(ctx, "ERR path exists and is not a file");
         }
-        fs->total_data_size -= existing->payload.file.size;
-        fsFileSetData(existing, data, datalen);
-        fs->total_data_size += datalen;
+        if (append) {
+            fsFileAppendData(existing, data, datalen);
+            fs->total_data_size += datalen;
+        } else {
+            fs->total_data_size -= existing->payload.file.size;
+            fsFileSetData(existing, data, datalen);
+            fs->total_data_size += datalen;
+        }
         existing->mtime = fsNowMs();
     } else {
         fsInode *inode = fsInodeCreate(FS_INODE_FILE, 0);
@@ -1830,10 +1846,15 @@ static int MV_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int ar
         // Move descendants.
         for (size_t i = 0; i < nmoves; i++) {
             // New path = dst + suffix after src.
+            // suffix starts with '/', so concatenate directly instead of
+            // using fsJoinPath (which would treat '/' as absolute).
             const char *suffix = moves[i].oldpath + nsrclen;
             size_t suffixlen = moves[i].oldlen - nsrclen;
-            char *newpath = fsJoinPath(dst, ndstlen, suffix, suffixlen);
-            size_t newlen = strlen(newpath);
+            size_t newlen = ndstlen + suffixlen;
+            char *newpath = RedisModule_Alloc(newlen + 1);
+            memcpy(newpath, dst, ndstlen);
+            memcpy(newpath + ndstlen, suffix, suffixlen);
+            newpath[newlen] = '\0';
 
             fsInode *inode_val = fsLookup(fs, moves[i].oldpath, moves[i].oldlen);
             if (inode_val) {

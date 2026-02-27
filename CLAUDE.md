@@ -45,6 +45,7 @@ Redis-FS is a native Redis module (C, `-std=c11`) that registers a custom data t
 - **Bloom filters for GREP**: each file inode has a 256-byte bloom filter built from lowercased trigrams. `FS.GREP` skips files whose bloom filter proves the literal portion of the pattern cannot match.
 - **Binary detection in GREP**: files with NUL bytes in the first 8KB report "Binary file matches" instead of content.
 - **Parent auto-creation** (`fsEnsureParents`): write commands like `FS.ECHO` and `FS.MKDIR PARENTS` recursively create missing ancestor directories.
+- **FS.ECHO APPEND flag**: `FS.ECHO key path content APPEND` appends instead of overwriting, matching the shell `echo >>` pattern. `FS.APPEND` is retained as a backward-compatible alias.
 - **RDB format version 0**: serializes all inodes with path/type/metadata/payload; bloom filters are rebuilt on load, not persisted.
 
 ### Command Pattern
