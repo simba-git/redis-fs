@@ -2209,6 +2209,117 @@ static int GREP_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int 
 }
 
 /* ===================================================================
+ * FS.TRUNCATE key path length
+ *
+ * Truncate or extend a file to the specified length.
+ * Follows symlinks. length < size shrinks, length > size zero-extends.
+ * =================================================================== */
+static int TRUNCATE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    RedisModule_AutoMemory(ctx);
+    if (argc != 4) return RedisModule_WrongArity(ctx);
+
+    RedisModuleKey *key;
+    fsObject *fs = fsGetObject(ctx, argv[1], REDISMODULE_READ|REDISMODULE_WRITE, &key);
+    if (!key) return REDISMODULE_OK;
+
+    size_t pathlen;
+    const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
+    char *path = fsNormalizePath(rawpath, pathlen);
+    size_t npathlen = strlen(path);
+
+    // Resolve symlinks.
+    int err;
+    char *resolved = fsResolvePath(fs, path, npathlen, &err);
+    RedisModule_Free(path);
+    if (err) return RedisModule_ReplyWithError(ctx, "ERR too many levels of symbolic links");
+
+    fsInode *inode = fsLookup(fs, resolved, strlen(resolved));
+    if (!inode) {
+        RedisModule_Free(resolved);
+        return RedisModule_ReplyWithError(ctx, "ERR no such file or directory");
+    }
+    if (inode->type != FS_INODE_FILE) {
+        RedisModule_Free(resolved);
+        return RedisModule_ReplyWithError(ctx, "ERR not a file");
+    }
+
+    long long length;
+    if (RedisModule_StringToLongLong(argv[3], &length) != REDISMODULE_OK || length < 0) {
+        RedisModule_Free(resolved);
+        return RedisModule_ReplyWithError(ctx, "ERR length must be a non-negative integer");
+    }
+
+    size_t newlen = (size_t)length;
+    size_t oldlen = inode->payload.file.size;
+
+    if (newlen == 0) {
+        // Truncate to zero.
+        fs->total_data_size -= oldlen;
+        if (inode->payload.file.data) RedisModule_Free(inode->payload.file.data);
+        inode->payload.file.data = NULL;
+        inode->payload.file.size = 0;
+        memset(inode->payload.file.bloom, 0, FS_BLOOM_BYTES);
+    } else if (newlen < oldlen) {
+        // Shrink.
+        fs->total_data_size -= (oldlen - newlen);
+        inode->payload.file.data = RedisModule_Realloc(inode->payload.file.data, newlen);
+        inode->payload.file.size = newlen;
+        fsBloomBuild(inode);
+    } else if (newlen > oldlen) {
+        // Zero-extend.
+        fs->total_data_size += (newlen - oldlen);
+        inode->payload.file.data = RedisModule_Realloc(inode->payload.file.data, newlen);
+        memset(inode->payload.file.data + oldlen, 0, newlen - oldlen);
+        inode->payload.file.size = newlen;
+        fsBloomBuild(inode);
+    }
+    // newlen == oldlen: no-op.
+
+    inode->mtime = fsNowMs();
+    RedisModule_Free(resolved);
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    RedisModule_ReplicateVerbatim(ctx);
+    return REDISMODULE_OK;
+}
+
+/* ===================================================================
+ * FS.UTIMENS key path atime_ms mtime_ms
+ *
+ * Set access and modification times. Value of -1 means "don't change"
+ * (matches POSIX UTIME_OMIT). Does NOT follow symlinks (matches
+ * utimensat with AT_SYMLINK_NOFOLLOW).
+ * =================================================================== */
+static int UTIMENS_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    RedisModule_AutoMemory(ctx);
+    if (argc != 5) return RedisModule_WrongArity(ctx);
+
+    RedisModuleKey *key;
+    fsObject *fs = fsGetObject(ctx, argv[1], REDISMODULE_READ|REDISMODULE_WRITE, &key);
+    if (!key) return REDISMODULE_OK;
+
+    size_t pathlen;
+    const char *rawpath = RedisModule_StringPtrLen(argv[2], &pathlen);
+    char *path = fsNormalizePath(rawpath, pathlen);
+
+    fsInode *inode = fsLookup(fs, path, strlen(path));
+    RedisModule_Free(path);
+    if (!inode) return RedisModule_ReplyWithError(ctx, "ERR no such file or directory");
+
+    long long atime_ms, mtime_ms;
+    if (RedisModule_StringToLongLong(argv[3], &atime_ms) != REDISMODULE_OK)
+        return RedisModule_ReplyWithError(ctx, "ERR atime_ms must be an integer");
+    if (RedisModule_StringToLongLong(argv[4], &mtime_ms) != REDISMODULE_OK)
+        return RedisModule_ReplyWithError(ctx, "ERR mtime_ms must be an integer");
+
+    if (atime_ms != -1) inode->atime = atime_ms;
+    if (mtime_ms != -1) inode->mtime = mtime_ms;
+
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    RedisModule_ReplicateVerbatim(ctx);
+    return REDISMODULE_OK;
+}
+
+/* ===================================================================
  * Module OnLoad — register type and commands
  * =================================================================== */
 
@@ -2313,6 +2424,14 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_CreateCommand(ctx, "FS.GREP",
         GREP_RedisCommand, "readonly", 1, 1, 1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx, "FS.TRUNCATE",
+        TRUNCATE_RedisCommand, "write", 1, 1, 1) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx, "FS.UTIMENS",
+        UTIMENS_RedisCommand, "write", 1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
     return REDISMODULE_OK;
