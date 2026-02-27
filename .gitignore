@@ -2,3 +2,4 @@
 *.xo
 *.so
 *.dSYM/
+tests/__pycache__/
