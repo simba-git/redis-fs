@@ -1,4 +1,5 @@
 from test import TestCase
+from tests.invariants import assert_tree_consistent
 
 
 class Rm(TestCase):
@@ -12,6 +13,7 @@ class Rm(TestCase):
         # Remove a file.
         r.execute_command("FS.ECHO", k, "/file.txt", "data")
         assert r.execute_command("FS.RM", k, "/file.txt") == 1
+        assert_tree_consistent(r, k)
 
         # Removing nonexistent path returns 0.
         assert r.execute_command("FS.RM", k, "/nope") == 0
@@ -45,3 +47,6 @@ class Rm(TestCase):
         assert r.execute_command("FS.TEST", k, "/tree") == 0
         assert r.execute_command("FS.TEST", k, "/tree/a") == 0
         assert r.execute_command("FS.TEST", k, "/tree/a/1.txt") == 0
+        # Key may have auto-deleted; recreate for invariant check.
+        r.execute_command("FS.ECHO", k, "/probe.txt", "ok")
+        assert_tree_consistent(r, k)

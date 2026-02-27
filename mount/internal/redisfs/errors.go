@@ -29,6 +29,13 @@ func mapError(err error) syscall.Errno {
 		return syscall.ENOTEMPTY
 	case strings.Contains(msg, "too many levels of symbolic links"):
 		return syscall.ELOOP
+	case strings.Contains(msg, "path depth exceeds limit"),
+		strings.Contains(msg, "mode must be"),
+		strings.Contains(msg, "uid out of range"),
+		strings.Contains(msg, "gid out of range"),
+		strings.Contains(msg, "cannot move a directory into its own subtree"),
+		strings.Contains(msg, "syntax error"):
+		return syscall.EINVAL
 	case strings.Contains(msg, "WRONGTYPE"):
 		return syscall.EINVAL
 	default:
