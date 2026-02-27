@@ -123,6 +123,8 @@ and merged `rm` and `rmdir` into one command.
 | find dir -name "*.txt" -type f | FS.FIND key /dir "*.txt" TYPE file | Filter by type                             |
 | grep -r "pattern" dir          | FS.GREP key /dir "*pattern*"       | Glob match on each line, bloom-accelerated |
 | grep -ri "pattern" dir         | FS.GREP key /dir "*pattern*" NOCASE| Case-insensitive                           |
+| truncate -s 100 file           | FS.TRUNCATE key /file 100          | Shrink, extend, or zero a file             |
+| touch -t file                  | FS.UTIMENS key /file atime mtime   | Set times in ms; -1 = don't change         |
 | df / du                        | FS.INFO key                        | File/dir/symlink counts + total bytes      |
 
 ## Data model
@@ -648,6 +650,46 @@ definitely don't match, but worst-case every file must be scanned.
 For large filesystems, keep your search scope narrow by specifying
 a deeper path.
 
+**FS.TRUNCATE: truncate or extend a file**
+
+    FS.TRUNCATE key path length
+
+Truncates or extends a file to the specified length in bytes. Follows
+symlinks.
+
+- If `length` is less than the current size, the file is shrunk
+- If `length` is greater, the file is zero-extended
+- If `length` is 0, the file content is cleared entirely
+
+Updates the file's mtime.
+
+    > FS.ECHO myfs /data.txt "Hello World"
+    OK
+    > FS.TRUNCATE myfs /data.txt 5
+    OK
+    > FS.CAT myfs /data.txt
+    "Hello"
+    > FS.TRUNCATE myfs /data.txt 0
+    OK
+    > FS.CAT myfs /data.txt
+    ""
+
+**FS.UTIMENS: set access and modification times**
+
+    FS.UTIMENS key path atime_ms mtime_ms
+
+Sets the access time and modification time for a path. Times are in
+milliseconds since epoch. A value of `-1` means "don't change" (matches
+POSIX `UTIME_OMIT` semantics).
+
+Does NOT follow symlinks (matches POSIX `utimensat` with
+`AT_SYMLINK_NOFOLLOW`).
+
+    > FS.UTIMENS myfs /data.txt 1700000000000 1700000000000
+    OK
+    > FS.UTIMENS myfs /data.txt -1 1700000001000
+    OK
+
 # Glob pattern matching
 
 Both `FS.FIND` and `FS.GREP` use the same glob matcher, modeled after
@@ -782,9 +824,99 @@ depth. But for a typical depth of 3-5, this is negligible.
 - **Path format**: Always normalized to absolute. The module doesn't support or store relative paths internally
 - **Character set**: Paths are binary-safe bytes, but `/` is always the separator and `\0` terminates. Stick to UTF-8 for sanity
 
+# FUSE Mount
+
+The `mount/` directory contains `redis-fs-mount`, a Go FUSE daemon that
+mounts a Redis FS key as a real Linux filesystem. Any program — `ls`,
+`cat`, `vim`, `cp`, shell scripts, agents — can interact with the
+Redis-backed filesystem using standard file operations.
+
+## Building
+
+Requires Go 1.21+ and FUSE support (`libfuse3-dev` or equivalent):
+
+    cd mount
+    go build -o redis-fs-mount ./cmd/redis-fs-mount
+
+Or use the Makefile:
+
+    cd mount
+    make
+
+## Usage
+
+    redis-fs-mount [flags] <redis-key> <mountpoint>
+
+**Example:**
+
+    # Start Redis with the module
+    redis-server --loadmodule ./fs.so
+
+    # Seed some data
+    redis-cli FS.ECHO myfs /hello.txt "Hello World"
+
+    # Mount
+    mkdir -p /tmp/mnt
+    redis-fs-mount --foreground myfs /tmp/mnt
+
+    # Use it like a normal filesystem
+    cat /tmp/mnt/hello.txt          # → Hello World
+    echo "new file" > /tmp/mnt/new.txt
+    ls -la /tmp/mnt/
+    mkdir /tmp/mnt/subdir
+    mv /tmp/mnt/new.txt /tmp/mnt/subdir/
+
+    # Verify via Redis
+    redis-cli FS.CAT myfs /subdir/new.txt
+
+    # Unmount
+    fusermount -u /tmp/mnt
+
+## Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--redis` | `localhost:6379` | Redis server address |
+| `--password` | (none) | Redis password |
+| `--db` | `0` | Redis database number |
+| `--attr-timeout` | `1.0` | Attribute cache TTL in seconds |
+| `--readonly` | `false` | Mount read-only |
+| `--allow-other` | `false` | Allow other users to access mount |
+| `--foreground` | `true` | Run in foreground |
+| `--debug` | `false` | Enable FUSE debug logging (very verbose) |
+
+## How it works
+
+The daemon translates Linux VFS system calls into `FS.*` Redis commands:
+
+| Operation | Redis command |
+|-----------|---------------|
+| `stat`, `ls` | `FS.STAT`, `FS.LS LONG` |
+| `cat`, `read` | `FS.CAT` |
+| `write`, `echo >` | `FS.ECHO` (buffered, flushed on close/fsync) |
+| `touch`, `creat` | `FS.TOUCH` |
+| `mkdir` | `FS.MKDIR PARENTS` |
+| `rm`, `unlink` | `FS.RM` |
+| `mv`, `rename` | `FS.MV` |
+| `ln -s` | `FS.LN` |
+| `readlink` | `FS.READLINK` |
+| `chmod` | `FS.CHMOD` |
+| `chown` | `FS.CHOWN` |
+| `truncate` | `FS.TRUNCATE` |
+| `utimes` | `FS.UTIMENS` |
+| `df` | `FS.INFO` |
+
+Writes are buffered in memory per file handle and flushed to Redis on
+`close()` or `fsync()`. Attribute and directory listing results are
+cached with a configurable TTL (default 1 second) to reduce Redis
+round-trips.
+
+All files appear owned by the mounting user's uid/gid, regardless of
+what's stored in Redis (avoids permission issues for local use).
+
 # What this module does NOT do
 
-- **FUSE mount**: This is a Redis data type, not a mountable filesystem. If you want to mount it, write a FUSE adapter that talks to Redis.
+- **FUSE mount**: See the [FUSE Mount](#fuse-mount) section below for `redis-fs-mount`, a Go daemon that mounts a Redis FS key as a real Linux filesystem.
 - **Access control**: Mode bits and uid/gid are stored but not enforced. They're metadata for your application to check, not a security boundary. Use Redis ACLs for access control.
 - **File locking**: No `flock`, no advisory locks. Coordinate in your application or use Redis WATCH/MULTI if you need CAS semantics.
 - **Extended attributes**: Phase 2. Coming as `FS.XATTR.SET/GET/DEL/LIST`.
