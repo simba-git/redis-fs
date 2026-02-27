@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +40,40 @@ func main() {
 	if flag.NArg() != 2 {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	// Optional daemon mode: re-exec detached and return in parent.
+	if !*foreground && os.Getenv("REDIS_FS_DAEMON") != "1" {
+		args := make([]string, 0, len(os.Args))
+		for i := 1; i < len(os.Args); i++ {
+			a := os.Args[i]
+			if a == "--foreground" {
+				i++ // skip value as well
+				continue
+			}
+			if strings.HasPrefix(a, "--foreground=") {
+				continue
+			}
+			args = append(args, a)
+		}
+		args = append(args, "--foreground=true")
+
+		cmd := exec.Command(os.Args[0], args...)
+		cmd.Env = append(os.Environ(), "REDIS_FS_DAEMON=1")
+		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			log.Fatalf("daemon mode failed opening %s: %v", os.DevNull, err)
+		}
+		defer devNull.Close()
+		cmd.Stdin = devNull
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err := cmd.Start(); err != nil {
+			log.Fatalf("daemon mode failed: %v", err)
+		}
+		fmt.Printf("redis-fs-mount started in background (pid %d)\n", cmd.Process.Pid)
+		return
 	}
 
 	redisKey := flag.Arg(0)
@@ -72,13 +108,11 @@ func main() {
 	opts := &redisfs.Options{
 		AttrTimeout: time.Duration(*attrTimeout * float64(time.Second)),
 		ReadOnly:    *readOnly,
+		AllowOther:  *allowOther,
 		Debug:       *debug,
 		UID:         uid,
 		GID:         gid,
 	}
-
-	_ = *allowOther
-	_ = *foreground
 
 	log.Printf("Mounting Redis FS key %q at %s", redisKey, mountpoint)
 	log.Printf("Redis: %s (db %d)", *redisAddr, *redisDB)

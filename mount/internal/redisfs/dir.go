@@ -176,8 +176,8 @@ func (n *FSNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbe
 		return mapError(err)
 	}
 
-	n.root().invalidatePath(oldPath)
-	n.root().invalidatePath(newPath)
+	n.root().invalidatePathPrefix(oldPath)
+	n.root().invalidatePathPrefix(newPath)
 	return 0
 }
 

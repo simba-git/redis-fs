@@ -20,6 +20,7 @@ import (
 type Options struct {
 	AttrTimeout time.Duration
 	ReadOnly    bool
+	AllowOther  bool
 	Debug       bool
 	UID         uint32
 	GID         uint32
@@ -52,6 +53,13 @@ func (r *FSRoot) invalidatePath(path string) {
 	parent := filepath.Dir(path)
 	r.dirCache.Invalidate(parent)
 	r.attrCache.Invalidate(parent)
+}
+
+// invalidatePathPrefix invalidates caches for a subtree and its parent directory.
+func (r *FSRoot) invalidatePathPrefix(path string) {
+	r.attrCache.InvalidatePrefix(path)
+	r.dirCache.InvalidatePrefix(path)
+	r.invalidatePath(path)
 }
 
 // newChild creates a child FSNode for the given basename.
@@ -90,7 +98,7 @@ func Mount(mountpoint string, c *client.Client, opts *Options) (*fuse.Server, er
 
 	fuseOpts := &fs.Options{
 		MountOptions: fuse.MountOptions{
-			AllowOther: false,
+			AllowOther: opts.AllowOther,
 			FsName:     "redis-fs",
 			Name:       "redis-fs",
 			Debug:      opts.Debug,
