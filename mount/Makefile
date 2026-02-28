@@ -1,9 +1,12 @@
-all: redis-fs-mount
+all: redis-fs-mount rfs
 
 redis-fs-mount:
 	go build -o redis-fs-mount ./cmd/redis-fs-mount
 
-clean:
-	rm -f redis-fs-mount
+rfs:
+	go build -o rfs ./cmd/rfs
 
-.PHONY: all clean
+clean:
+	rm -f redis-fs-mount rfs redis-fs-cli
+
+.PHONY: all clean redis-fs-mount rfs
