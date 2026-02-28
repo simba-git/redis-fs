@@ -19,6 +19,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 
 from .agent import Agent, AgentConfig, AgentEvent
+from .memory import MemoryManager, MEMORY_FILES
 from .tools import ToolExecutor
 
 
@@ -33,11 +34,16 @@ def print_welcome(session_id: str | None = None):
         "An OpenClaw-style task-solving coding agent\n"
         "with Redis-FS backed persistent sandbox" + session_info + "\n\n"
         "[dim]Commands:[/dim]\n"
-        "  /task <desc> - Give the agent a task to solve\n"
-        "  /bash <cmd>  - Run a shell command directly\n"
-        "  /read <path> - Read a file\n"
-        "  /write <path> - Write a file (stdin)\n"
-        "  /ls [path]   - List files\n"
+        "  /task <desc>   - Give the agent a task to solve\n"
+        "  /bash <cmd>    - Run a shell command directly\n"
+        "  /read <path>   - Read a file\n"
+        "  /write <path>  - Write a file (stdin)\n"
+        "  /ls [path]     - List files\n\n"
+        "[dim]Memory (OpenClaw-style):[/dim]\n"
+        "  /memory        - List memory files\n"
+        "  /memory <name> - View a memory file (memory, soul, user, identity)\n"
+        "  /memory edit <name> - Edit a memory file (stdin)\n\n"
+        "[dim]Sessions:[/dim]\n"
         "  /session     - Show session info\n"
         "  /sessions    - List all sessions\n"
         "  /new         - Start new session\n"
@@ -287,6 +293,63 @@ def handle_command(cmd: str, tools: ToolExecutor, agent: Agent | None, config: A
             path = grep_parts[1] if len(grep_parts) > 1 else "/workspace"
             result = tools.execute("Grep", {"pattern": pattern, "path": path})
             console.print(result)
+
+    elif command == "/memory":
+        # Memory management commands (OpenClaw-style)
+        if agent is None:
+            console.print("[yellow]Memory requires an active agent session[/yellow]")
+        elif not arg:
+            # List memory files
+            memory = agent.memory
+            files = memory.list_memory_files()
+            if files:
+                table = Table(title="Memory Files")
+                table.add_column("File", style="cyan")
+                table.add_column("Path", style="dim")
+                for name, path in MEMORY_FILES.items():
+                    table.add_row(name, path)
+                for f in files:
+                    if f not in [p.split("/")[-1] for p in MEMORY_FILES.values()]:
+                        table.add_row(f, f"/memory/{f}")
+                console.print(table)
+            else:
+                console.print("[dim]No memory files yet[/dim]")
+        elif arg.startswith("edit "):
+            # Edit a memory file
+            name = arg[5:].strip()
+            if name not in MEMORY_FILES:
+                console.print(f"[red]Unknown memory file: {name}[/red]")
+                console.print(f"[dim]Available: {', '.join(MEMORY_FILES.keys())}[/dim]")
+            else:
+                console.print(f"Enter content for {name} (Ctrl+D when done):")
+                content = sys.stdin.read()
+                if agent.memory.set_memory(name, content):
+                    console.print(f"[green]Updated {name}[/green]")
+                else:
+                    console.print(f"[red]Failed to update {name}[/red]")
+        elif arg.startswith("append "):
+            # Append to memory
+            append_parts = arg[7:].split(maxsplit=1)
+            if len(append_parts) < 2:
+                console.print("[red]Usage: /memory append <name> <content>[/red]")
+            else:
+                name, content = append_parts[0], append_parts[1]
+                if name not in MEMORY_FILES:
+                    console.print(f"[red]Unknown memory file: {name}[/red]")
+                else:
+                    if agent.memory.append_memory(name, content):
+                        console.print(f"[green]Appended to {name}[/green]")
+                    else:
+                        console.print(f"[red]Failed to append[/red]")
+        else:
+            # View a memory file
+            name = arg.strip()
+            if name not in MEMORY_FILES:
+                console.print(f"[red]Unknown memory file: {name}[/red]")
+                console.print(f"[dim]Available: {', '.join(MEMORY_FILES.keys())}[/dim]")
+            else:
+                content = agent.memory.get_memory(name)
+                console.print(Panel(Markdown(content), title=f"{name}.md", border_style="cyan"))
 
     else:
         console.print(f"[red]Unknown command: {command}[/red]")

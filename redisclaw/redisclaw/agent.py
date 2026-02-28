@@ -21,6 +21,7 @@ from typing import Any, Callable, Generator
 import anthropic
 import redis
 
+from .memory import MemoryManager
 from .tools import TOOLS, ToolExecutor
 
 
@@ -29,12 +30,12 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Minimal system prompt like Pi agent
-# Pi reportedly has "the shortest system prompt of any agent"
-SYSTEM_PROMPT = """You are RedisClaw, a coding agent.
+# Base system prompt - memory context is prepended dynamically
+BASE_SYSTEM_PROMPT = """You are RedisClaw, a coding agent with persistent memory.
 
 Environment:
 - Workspace: /workspace (persistent, Redis-backed filesystem)
+- Memory: /memory (persistent markdown files for context)
 - Tools: Bash, Read, Write, Edit, Glob, Grep, TodoWrite
 - Available: python3, node, npm, git, common CLI tools
 
@@ -44,6 +45,11 @@ Approach:
 3. Execute step by step
 4. Verify results
 5. Iterate until complete
+
+Memory System:
+- /memory/MEMORY.md contains important facts to remember
+- You can read/write memory files to persist learnings
+- Use Write tool to update memory when you learn important things
 
 Be concise. Show your work. Fix errors when they occur."""
 
@@ -176,11 +182,34 @@ class Agent:
         self._redis = redis.from_url(self.config.redis_url)
         self.session_manager = SessionManager(self._redis)
 
+        # Memory management (OpenClaw-style markdown files)
+        self.memory = MemoryManager(
+            redis_client=self._redis,
+            redis_key=self.config.fs_key,
+        )
+        # Initialize default memory files if they don't exist
+        try:
+            self.memory.initialize_defaults()
+        except Exception:
+            pass  # Don't fail if memory initialization fails
+
         # Load or create session
         if session_id:
             self.session = self.session_manager.load(session_id) or Session(id=session_id)
         else:
             self.session = Session()
+
+    def _build_system_prompt(self) -> str:
+        """Build the full system prompt including memory context."""
+        memory_context = ""
+        try:
+            memory_context = self.memory.get_context_prompt()
+        except Exception:
+            pass  # Don't fail if memory read fails
+
+        if memory_context:
+            return f"{memory_context}\n\n{BASE_SYSTEM_PROMPT}"
+        return BASE_SYSTEM_PROMPT
 
     def run(
         self,
@@ -241,7 +270,7 @@ class Agent:
                 response = self.client.messages.create(
                     model=self.config.model,
                     max_tokens=self.config.max_tokens,
-                    system=SYSTEM_PROMPT,
+                    system=self._build_system_prompt(),
                     tools=TOOLS,
                     messages=api_messages,
                 )

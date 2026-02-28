@@ -98,6 +98,40 @@ The agent uses a minimal, powerful tool set (like Pi agent):
 | `Grep` | Search file contents |
 | `TodoWrite` | Track multi-step task progress |
 
+## Memory System (OpenClaw-style)
+
+RedisClaw uses markdown files for persistent memory, inspired by OpenClaw:
+
+| File | Description |
+|------|-------------|
+| `/memory/MEMORY.md` | Long-term curated memory (always in context) |
+| `/memory/SOUL.md` | AI personality, rules, tone |
+| `/memory/USER.md` | User preferences, patterns, info |
+| `/memory/IDENTITY.md` | AI identity/persona |
+| `/memory/AGENTS.md` | Behavioral guidelines |
+| `/memory/HEARTBEAT.md` | Periodic check tasks (future) |
+| `/memory/YYYY-MM-DD.md` | Daily conversation logs |
+
+Memory files are automatically loaded into the system prompt, giving
+the agent persistent context across sessions.
+
+**CLI Commands:**
+
+```bash
+/memory          # List memory files
+/memory soul     # View SOUL.md
+/memory user     # View USER.md
+/memory edit soul    # Edit SOUL.md (enter content, Ctrl+D to save)
+/memory append memory "Important fact to remember"
+```
+
+The agent can also read/write memory files using the standard tools:
+
+```
+Agent> Read the file /memory/MEMORY.md
+Agent> Write to /memory/MEMORY.md and add "User prefers TypeScript"
+```
+
 ## Session Management
 
 Sessions persist to Redis with a 7-day TTL:

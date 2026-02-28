@@ -391,3 +391,84 @@ class TestSessionManagement:
         manager.delete(s1.id)
         manager.delete(s2.id)
 
+
+class TestMemorySystem:
+    """Test OpenClaw-style memory system."""
+
+    def test_memory_manager_basic(self, redis_client):
+        """MemoryManager can read/write memory files."""
+        from redisclaw.memory import MemoryManager
+
+        manager = MemoryManager(redis_client, redis_key=FS_KEY)
+
+        # Write a memory file
+        test_content = "# Test Memory\n\nThis is a test."
+        success = manager.write_file("/memory/test.md", test_content)
+        assert success is True
+
+        # Read it back
+        content = manager.read_file("/memory/test.md")
+        assert content == test_content
+
+    def test_memory_defaults(self, redis_client):
+        """MemoryManager creates default memory files."""
+        from redisclaw.memory import MemoryManager, MEMORY_FILES
+
+        manager = MemoryManager(redis_client, redis_key=FS_KEY)
+
+        # Initialize defaults
+        manager.initialize_defaults()
+
+        # Check that default files exist
+        for name in MEMORY_FILES:
+            content = manager.get_memory(name)
+            assert content is not None
+            assert len(content) > 0
+
+    def test_memory_context_prompt(self, redis_client):
+        """MemoryManager builds context prompt from memory files."""
+        from redisclaw.memory import MemoryManager
+
+        manager = MemoryManager(redis_client, redis_key=FS_KEY)
+        manager.initialize_defaults()
+
+        # Get context prompt
+        context = manager.get_context_prompt()
+        assert "<memory>" in context
+        assert "<soul>" in context
+        assert "<identity>" in context
+
+    def test_daily_log(self, redis_client):
+        """MemoryManager can write daily logs."""
+        from redisclaw.memory import MemoryManager
+
+        manager = MemoryManager(redis_client, redis_key=FS_KEY)
+
+        # Append to daily log
+        success = manager.append_daily_log("Test entry 1")
+        assert success is True
+
+        # Read daily log
+        log = manager.get_daily_log()
+        assert "Test entry 1" in log
+
+    def test_append_memory(self, redis_client):
+        """MemoryManager can append to memory files."""
+        from redisclaw.memory import MemoryManager
+
+        manager = MemoryManager(redis_client, redis_key=FS_KEY)
+        manager.initialize_defaults()
+
+        # Get original content length
+        original = manager.get_memory("memory")
+        original_len = len(original)
+
+        # Append new content
+        success = manager.append_memory("memory", "## New Section\n\nAppended content.")
+        assert success is True
+
+        # Verify content was appended
+        updated = manager.get_memory("memory")
+        assert len(updated) > original_len
+        assert "Appended content" in updated
+
