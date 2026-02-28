@@ -1,44 +1,129 @@
-"""RedisClaw Agent - The core agent loop."""
+"""
+RedisClaw Agent - OpenClaw-style task-solving agent loop.
+
+The agent loop is the core runtime that:
+1. Receives a task/message
+2. Plans and executes using tools
+3. Iterates until the task is complete
+4. Maintains session state for context
+
+Like OpenClaw/Pi agent, we use a minimal system prompt and
+let the model figure out the best approach.
+"""
 
 import json
+import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Generator
+from datetime import datetime, timezone
+from typing import Any, Callable, Generator
+
+
+def utc_now_iso() -> str:
+    """Get current UTC time as ISO format string."""
+    return datetime.now(timezone.utc).isoformat()
 
 import anthropic
+import redis
 
 from .tools import TOOLS, ToolExecutor
 
 
-SYSTEM_PROMPT = """You are RedisClaw, a coding agent running in a sandboxed environment with a Redis-backed persistent filesystem.
+# Minimal system prompt like Pi agent
+# Pi reportedly has "the shortest system prompt of any agent"
+SYSTEM_PROMPT = """You are RedisClaw, a coding agent.
 
-## Environment
-- Your workspace is at /workspace in the sandbox
-- Files written via Redis-FS are immediately available in the sandbox
-- The sandbox has Python 3, Node.js, Git, and common dev tools
-- Files persist across sessions
+Environment:
+- Workspace: /workspace (persistent, Redis-backed filesystem)
+- Tools: Bash, Read, Write, Edit, Glob, Grep, TodoWrite
+- Available: python3, node, npm, git, common CLI tools
 
-## Guidelines
-1. When asked to write code, write it to a file and run it to verify
-2. Always check command output for errors
-3. Use relative paths from /workspace when possible
-4. Be concise but show your work
-5. If a task requires multiple steps, do them in sequence
+Approach:
+1. Understand the task
+2. Break it down if complex (use TodoWrite to track)
+3. Execute step by step
+4. Verify results
+5. Iterate until complete
 
-## Workflow
-1. Understand the request
-2. Plan your approach (briefly)
-3. Execute using tools
-4. Verify the results
-5. Report back
-
-You have access to: run_command, read_file, write_file, list_files, delete_file."""
+Be concise. Show your work. Fix errors when they occur."""
 
 
 @dataclass
 class Message:
     """A conversation message."""
     role: str
-    content: str
+    content: Any  # Can be str or list of content blocks
+    timestamp: str = field(default_factory=utc_now_iso)
+
+
+@dataclass
+class Session:
+    """Session state for conversation persistence."""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    messages: list[Message] = field(default_factory=list)
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        """Serialize session to dict."""
+        return {
+            "id": self.id,
+            "messages": [
+                {"role": m.role, "content": m.content, "timestamp": m.timestamp}
+                for m in self.messages
+            ],
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Session":
+        """Deserialize session from dict."""
+        return cls(
+            id=data["id"],
+            messages=[
+                Message(role=m["role"], content=m["content"], timestamp=m.get("timestamp", ""))
+                for m in data["messages"]
+            ],
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+            metadata=data.get("metadata", {}),
+        )
+
+
+class SessionManager:
+    """Manages session persistence in Redis."""
+
+    def __init__(self, redis_client: redis.Redis, prefix: str = "redisclaw:session:"):
+        self.redis = redis_client
+        self.prefix = prefix
+
+    def save(self, session: Session) -> None:
+        """Save session to Redis."""
+        session.updated_at = utc_now_iso()
+        key = f"{self.prefix}{session.id}"
+        self.redis.set(key, json.dumps(session.to_dict()))
+        # Set 7-day TTL for sessions
+        self.redis.expire(key, 7 * 24 * 3600)
+
+    def load(self, session_id: str) -> Session | None:
+        """Load session from Redis."""
+        key = f"{self.prefix}{session_id}"
+        data = self.redis.get(key)
+        if data:
+            return Session.from_dict(json.loads(data))
+        return None
+
+    def delete(self, session_id: str) -> None:
+        """Delete a session."""
+        self.redis.delete(f"{self.prefix}{session_id}")
+
+    def list_sessions(self) -> list[str]:
+        """List all session IDs."""
+        keys = self.redis.keys(f"{self.prefix}*")
+        return [k.decode().replace(self.prefix, "") for k in keys]
 
 
 @dataclass
@@ -49,19 +134,36 @@ class AgentConfig:
     fs_key: str = "sandbox"
     model: str = "claude-sonnet-4-20250514"
     max_tokens: int = 4096
+    max_iterations: int = 50  # Prevent infinite loops
+    timeout: int = 600  # 10 minute timeout like OpenClaw
 
 
-@dataclass 
-class AgentState:
-    """Mutable agent state."""
-    messages: list[Message] = field(default_factory=list)
-    tool_results: list[dict] = field(default_factory=list)
+@dataclass
+class AgentEvent:
+    """Event emitted during agent execution."""
+    type: str  # "lifecycle", "assistant", "tool"
+    phase: str  # "start", "delta", "end", "error"
+    data: Any = None
+    timestamp: str = field(default_factory=utc_now_iso)
 
 
 class Agent:
-    """The RedisClaw agent with tool-use loop."""
-    
-    def __init__(self, config: AgentConfig | None = None):
+    """
+    RedisClaw agent with OpenClaw-style agent loop.
+
+    The agent loop:
+    1. Takes user input
+    2. Calls the model
+    3. If model returns tool calls, executes them
+    4. Repeats until model gives a final response
+    5. Persists session state
+    """
+
+    def __init__(
+        self,
+        config: AgentConfig | None = None,
+        session_id: str | None = None,
+    ):
         self.config = config or AgentConfig()
         self.client = anthropic.Anthropic()
         self.tools = ToolExecutor(
@@ -69,100 +171,233 @@ class Agent:
             self.config.redis_url,
             self.config.fs_key,
         )
-        self.state = AgentState()
-    
+
+        # Session management
+        self._redis = redis.from_url(self.config.redis_url)
+        self.session_manager = SessionManager(self._redis)
+
+        # Load or create session
+        if session_id:
+            self.session = self.session_manager.load(session_id) or Session(id=session_id)
+        else:
+            self.session = Session()
+
+    def run(
+        self,
+        task: str,
+        on_event: Callable[[AgentEvent], None] | None = None,
+    ) -> Generator[AgentEvent, None, str]:
+        """
+        Run the agent loop to solve a task.
+
+        This is the main entry point. It:
+        1. Adds the task as a user message
+        2. Iterates through model calls and tool execution
+        3. Yields events during execution
+        4. Returns the final response
+
+        Args:
+            task: The task/message from the user
+            on_event: Optional callback for events
+
+        Yields:
+            AgentEvent objects for streaming UI updates
+
+        Returns:
+            The final assistant response
+        """
+        # Emit lifecycle start
+        start_event = AgentEvent(type="lifecycle", phase="start", data={"task": task})
+        yield start_event
+        if on_event:
+            on_event(start_event)
+
+        # Add user message
+        self.session.messages.append(Message(role="user", content=task))
+
+        start_time = time.time()
+        iterations = 0
+        final_response = ""
+
+        try:
+            while iterations < self.config.max_iterations:
+                # Check timeout
+                if time.time() - start_time > self.config.timeout:
+                    error_event = AgentEvent(
+                        type="lifecycle", phase="error",
+                        data={"error": "Agent timeout exceeded"}
+                    )
+                    yield error_event
+                    if on_event:
+                        on_event(error_event)
+                    break
+
+                iterations += 1
+
+                # Build API messages
+                api_messages = self._build_api_messages()
+
+                # Call model
+                response = self.client.messages.create(
+                    model=self.config.model,
+                    max_tokens=self.config.max_tokens,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=api_messages,
+                )
+
+                # Process response
+                assistant_content = []
+                tool_uses = []
+                text_parts = []
+
+                for block in response.content:
+                    if block.type == "text":
+                        text_parts.append(block.text)
+                        assistant_content.append({"type": "text", "text": block.text})
+
+                        # Emit assistant delta
+                        delta_event = AgentEvent(
+                            type="assistant", phase="delta",
+                            data={"text": block.text}
+                        )
+                        yield delta_event
+                        if on_event:
+                            on_event(delta_event)
+
+                    elif block.type == "tool_use":
+                        tool_uses.append(block)
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        })
+
+                # Store assistant message
+                self.session.messages.append(Message(
+                    role="assistant",
+                    content=assistant_content
+                ))
+
+                # If no tool use, we're done
+                if not tool_uses:
+                    final_response = "\n".join(text_parts)
+                    break
+
+                # Execute tools
+                tool_results = []
+                for tool_use in tool_uses:
+                    # Emit tool start
+                    tool_start = AgentEvent(
+                        type="tool", phase="start",
+                        data={"name": tool_use.name, "input": tool_use.input}
+                    )
+                    yield tool_start
+                    if on_event:
+                        on_event(tool_start)
+
+                    # Execute
+                    result = self.tools.execute(tool_use.name, tool_use.input)
+
+                    # Truncate very long outputs
+                    if len(result) > 10000:
+                        result = result[:10000] + "\n... (truncated)"
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": result,
+                    })
+
+                    # Emit tool end
+                    tool_end = AgentEvent(
+                        type="tool", phase="end",
+                        data={"name": tool_use.name, "result": result[:1000]}
+                    )
+                    yield tool_end
+                    if on_event:
+                        on_event(tool_end)
+
+                # Add tool results as user message
+                self.session.messages.append(Message(
+                    role="user",
+                    content=tool_results
+                ))
+
+                # Check if model wanted to end after tools
+                if response.stop_reason == "end_turn":
+                    final_response = "\n".join(text_parts) if text_parts else ""
+                    break
+
+            # Save session
+            self.session_manager.save(self.session)
+
+            # Emit lifecycle end
+            end_event = AgentEvent(
+                type="lifecycle", phase="end",
+                data={
+                    "response": final_response,
+                    "iterations": iterations,
+                    "duration": time.time() - start_time,
+                }
+            )
+            yield end_event
+            if on_event:
+                on_event(end_event)
+
+            return final_response
+
+        except Exception as e:
+            error_event = AgentEvent(
+                type="lifecycle", phase="error",
+                data={"error": str(e)}
+            )
+            yield error_event
+            if on_event:
+                on_event(error_event)
+            raise
+
     def chat(self, user_message: str) -> Generator[str, None, None]:
         """
-        Send a message and yield responses.
-        
-        This is the main agent loop. It:
-        1. Sends the user message to Claude
-        2. If Claude wants to use tools, executes them
-        3. Continues until Claude gives a final response
+        Simple chat interface that yields text updates.
+
+        This is a convenience wrapper around run() for simpler use cases.
         """
-        self.state.messages.append(Message(role="user", content=user_message))
-        
-        while True:
-            # Build messages for API
-            api_messages = [
-                {"role": m.role, "content": m.content}
-                for m in self.state.messages
-            ]
-            
-            # Call Claude
-            response = self.client.messages.create(
-                model=self.config.model,
-                max_tokens=self.config.max_tokens,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=api_messages,
-            )
-            
-            # Process response
-            assistant_content = []
-            tool_uses = []
-            text_response = ""
-            
-            for block in response.content:
-                if block.type == "text":
-                    text_response += block.text
-                    assistant_content.append({"type": "text", "text": block.text})
-                elif block.type == "tool_use":
-                    tool_uses.append(block)
-                    assistant_content.append({
-                        "type": "tool_use",
-                        "id": block.id,
-                        "name": block.name,
-                        "input": block.input,
-                    })
-            
-            # Add assistant message
-            self.state.messages.append(Message(
-                role="assistant",
-                content=json.dumps(assistant_content) if tool_uses else text_response
-            ))
-            
-            # If no tool use, we're done
-            if not tool_uses:
-                yield text_response
-                return
-            
-            # Execute tools
-            tool_results = []
-            for tool_use in tool_uses:
-                yield f"\n🔧 {tool_use.name}: {json.dumps(tool_use.input)}\n"
-                
-                result = self.tools.execute(tool_use.name, tool_use.input)
-                
-                # Truncate very long outputs
-                if len(result) > 10000:
-                    result = result[:10000] + "\n... (truncated)"
-                
+        for event in self.run(user_message):
+            if event.type == "assistant" and event.phase == "delta":
+                yield event.data.get("text", "")
+            elif event.type == "tool" and event.phase == "start":
+                yield f"\n🔧 {event.data['name']}: {json.dumps(event.data['input'])}\n"
+            elif event.type == "tool" and event.phase == "end":
+                result = event.data.get("result", "")
                 yield f"📤 {result[:500]}{'...' if len(result) > 500 else ''}\n"
-                
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use.id,
-                    "content": result,
-                })
-            
-            # Add tool results as user message (Claude's convention)
-            self.state.messages.append(Message(
-                role="user",
-                content=json.dumps(tool_results)
-            ))
-            
-            # Check stop reason
-            if response.stop_reason == "end_turn":
-                if text_response:
-                    yield text_response
-                return
-    
-    def reset(self):
-        """Clear conversation history."""
-        self.state = AgentState()
-    
-    def close(self):
+            elif event.type == "lifecycle" and event.phase == "error":
+                yield f"\n❌ Error: {event.data.get('error', 'Unknown error')}\n"
+
+    def _build_api_messages(self) -> list[dict]:
+        """Build messages list for API call."""
+        api_messages = []
+
+        for msg in self.session.messages:
+            if isinstance(msg.content, str):
+                api_messages.append({"role": msg.role, "content": msg.content})
+            else:
+                # Already structured content (tool use/results)
+                api_messages.append({"role": msg.role, "content": msg.content})
+
+        return api_messages
+
+    def reset(self) -> None:
+        """Clear conversation and start new session."""
+        self.session = Session()
+
+    def get_session_id(self) -> str:
+        """Get the current session ID."""
+        return self.session.id
+
+    def close(self) -> None:
         """Clean up resources."""
         self.tools.close()
+        self._redis.close()
 
