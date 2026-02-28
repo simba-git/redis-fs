@@ -2,3 +2,5 @@
 *.xo
 *.so
 *.dSYM/
+rfs
+mount/redis-fs-mount
